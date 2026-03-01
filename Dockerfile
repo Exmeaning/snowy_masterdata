@@ -62,6 +62,10 @@ echo "Start: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 haruki-builder -mode=serve -repo=/data/repo -serve-dir=/data/serve -workers=2 &
 BUILDER_PID=$!
 
+# 动态绑定端口（Zeabur 等 PaaS 会传入 PORT 环境变量）
+PORT="${PORT:-80}"
+sed -i "s/:80 {/:$PORT {/g" /etc/caddy/Caddyfile
+
 # Caddy（后台）
 caddy run --config /etc/caddy/Caddyfile &
 CADDY_PID=$!

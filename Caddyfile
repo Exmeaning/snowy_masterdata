@@ -3,7 +3,7 @@
     admin off
 }
 
-: { $PORT:80 } {
+:80 {
     root * /data/serve
 
     file_server {
