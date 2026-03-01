@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log"
 	"os"
 	"os/exec"
@@ -15,17 +16,91 @@ import (
 
 const (
 	repoURL      = "https://github.com/Team-Haruki/haruki-sekai-master.git"
-	repoDir      = "/data/repo"
-	serveDir     = "/data/serve"
-	syncMarker   = "/data/serve/.git_synced"
 	pollInterval = 1 * time.Minute
-	maxWorkers   = 0 // 0 = use runtime.NumCPU()
 )
 
-func main() {
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	log.Printf("=== Haruki Builder Starting (CPUs: %d) ===", runtime.NumCPU())
+var (
+	flagMode     string
+	flagRepoDir  string
+	flagServeDir string
+	flagWorkers  int
+)
 
+func init() {
+	flag.StringVar(&flagMode, "mode", "serve", "运行模式: build (构建阶段全量压缩) | serve (生产阶段增量监测)")
+	flag.StringVar(&flagRepoDir, "repo", "/data/repo", "Git 仓库目录")
+	flag.StringVar(&flagServeDir, "serve-dir", "/data/serve", "静态文件服务目录")
+	flag.IntVar(&flagWorkers, "workers", 0, "并行压缩线程数 (0=CPU核心数)")
+}
+
+func main() {
+	flag.Parse()
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+
+	if flagWorkers <= 0 {
+		flagWorkers = runtime.NumCPU()
+	}
+
+	log.Printf("=== Haruki Builder [mode=%s, cpus=%d, workers=%d] ===", flagMode, runtime.NumCPU(), flagWorkers)
+
+	switch flagMode {
+	case "build":
+		runBuild()
+	case "serve":
+		runServe()
+	default:
+		log.Fatalf("Unknown mode: %s (use 'build' or 'serve')", flagMode)
+	}
+}
+
+// ══════════════════════════════════════════════════════════════
+// build 模式：Docker 构建阶段执行，全量 clone + 预处理 + 压缩
+// ══════════════════════════════════════════════════════════════
+func runBuild() {
+	ctx := context.Background()
+
+	// 1. Clone
+	if err := fullClone(ctx, flagRepoDir); err != nil {
+		log.Fatalf("Clone failed: %v", err)
+	}
+
+	// 2. 预处理
+	log.Println("Running preprocessor...")
+	if err := RunPreprocessor(flagRepoDir); err != nil {
+		log.Printf("WARNING: Preprocessor failed: %v", err)
+	}
+
+	// 3. 同步到 serve 目录（排除 .git）
+	if err := syncToServeDir(flagRepoDir, flagServeDir); err != nil {
+		log.Fatalf("Sync failed: %v", err)
+	}
+
+	// 4. 记录当前 commit hash 供运行阶段使用
+	hash, err := getCurrentCommit(ctx, flagRepoDir)
+	if err != nil {
+		log.Fatalf("Failed to get commit hash: %v", err)
+	}
+	commitFile := filepath.Join(flagServeDir, ".last_commit")
+	if err := os.WriteFile(commitFile, []byte(hash), 0644); err != nil {
+		log.Fatalf("Failed to write commit hash: %v", err)
+	}
+	log.Printf("Current commit: %s", hash)
+
+	// 5. 全量压缩
+	log.Println("Starting full pre-compression...")
+	compressor := NewCompressor(flagWorkers)
+	if err := compressor.CompressAll(ctx, flagServeDir); err != nil {
+		log.Fatalf("Compression failed: %v", err)
+	}
+
+	// 6. 清理 repo 目录以减小镜像（保留 .git 用于运行阶段 fetch）
+	log.Println("Build phase complete.")
+}
+
+// ══════════════════════════════════════════════════════════════
+// serve 模式：生产阶段，只做增量监测 + 增量压缩
+// ══════════════════════════════════════════════════════════════
+func runServe() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -37,41 +112,39 @@ func main() {
 		cancel()
 	}()
 
-	// Phase 1: Full clone
-	if err := fullClone(ctx); err != nil {
-		log.Fatalf("Initial clone failed: %v", err)
+	// 读取构建阶段写入的 commit hash
+	commitFile := filepath.Join(flagServeDir, ".last_commit")
+	lastCommitBytes, err := os.ReadFile(commitFile)
+	if err != nil {
+		log.Printf("WARNING: No .last_commit found, will do full diff on first check: %v", err)
+	}
+	lastCommit := string(lastCommitBytes)
+	if lastCommit != "" {
+		log.Printf("Resuming from build-time commit: %s", lastCommit)
 	}
 
-	// Run preprocessor on initial clone
-	log.Println("Running preprocessor on initial clone...")
-	if err := RunPreprocessor(repoDir); err != nil {
-		log.Printf("WARNING: Preprocessor failed on initial clone: %v", err)
+	// 确保 repo 目录存在（如果构建阶段已保留）
+	if _, err := os.Stat(filepath.Join(flagRepoDir, ".git")); os.IsNotExist(err) {
+		log.Println("Repo not found, performing initial clone...")
+		if err := fullClone(ctx, flagRepoDir); err != nil {
+			log.Fatalf("Clone failed: %v", err)
+		}
 	}
 
-	// Phase 2: Copy repo to serve directory and full compress
-	if err := syncToServeDir(); err != nil {
-		log.Fatalf("Initial sync failed: %v", err)
-	}
+	compressor := NewCompressor(flagWorkers)
+	watcher := NewWatcher(repoURL, flagRepoDir, flagServeDir, compressor, pollInterval, lastCommit)
 
-	// Create sync marker for the entrypoint script
-	if err := os.WriteFile(syncMarker, []byte(time.Now().UTC().String()), 0644); err != nil {
-		log.Printf("WARNING: Failed to write sync marker: %v", err)
-	}
-
-	log.Println("Starting full pre-compression of all files...")
-	compressor := NewCompressor(maxWorkers)
-	if err := compressor.CompressAll(ctx, serveDir); err != nil {
-		log.Fatalf("Initial compression failed: %v", err)
-	}
-
-	// Phase 3: Start watcher loop
-	watcher := NewWatcher(repoURL, repoDir, serveDir, compressor, pollInterval)
+	log.Println("Entering watch loop (interval: 1 min)...")
 	watcher.Run(ctx)
 
 	log.Println("=== Haruki Builder Stopped ===")
 }
 
-func fullClone(ctx context.Context) error {
+// ══════════════════════════════════════════════════════════════
+// 公共辅助函数
+// ══════════════════════════════════════════════════════════════
+
+func fullClone(ctx context.Context, repoDir string) error {
 	if _, err := os.Stat(repoDir); err == nil {
 		log.Println("Removing existing repo directory...")
 		if err := os.RemoveAll(repoDir); err != nil {
@@ -79,19 +152,24 @@ func fullClone(ctx context.Context) error {
 		}
 	}
 
-	log.Printf("Cloning %s into %s ...", repoURL, repoDir)
+	log.Printf("Cloning %s ...", repoURL)
 	cmd := exec.CommandContext(ctx, "git", "clone", "--depth=1", repoURL, repoDir)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return err
-	}
-	log.Println("Clone completed.")
-	return nil
+	return cmd.Run()
 }
 
-func syncToServeDir() error {
-	log.Printf("Syncing repo to serve directory %s ...", serveDir)
+func getCurrentCommit(ctx context.Context, repoDir string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", "-C", repoDir, "rev-parse", "HEAD")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return trimString(string(out)), nil
+}
+
+func syncToServeDir(repoDir, serveDir string) error {
+	log.Printf("Syncing to %s ...", serveDir)
 
 	if err := os.MkdirAll(serveDir, 0755); err != nil {
 		return err
@@ -122,13 +200,7 @@ func syncToServeDir() error {
 }
 
 func isGitPath(relPath string) bool {
-	if relPath == ".git" {
-		return true
-	}
-	if len(relPath) >= 5 && relPath[:5] == ".git/" {
-		return true
-	}
-	return false
+	return relPath == ".git" || (len(relPath) >= 5 && relPath[:5] == ".git/")
 }
 
 func copyFile(src, dst string) error {
@@ -136,22 +208,28 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	dir := filepath.Dir(dst)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
 		return err
 	}
 	return os.WriteFile(dst, data, 0644)
 }
 
+func trimString(s string) string {
+	result := s
+	for len(result) > 0 && (result[len(result)-1] == '\n' || result[len(result)-1] == '\r' || result[len(result)-1] == ' ') {
+		result = result[:len(result)-1]
+	}
+	return result
+}
+
+// WorkerPool 控制并发
 type WorkerPool struct {
 	sem chan struct{}
 	wg  sync.WaitGroup
 }
 
 func NewWorkerPool(size int) *WorkerPool {
-	return &WorkerPool{
-		sem: make(chan struct{}, size),
-	}
+	return &WorkerPool{sem: make(chan struct{}, size)}
 }
 
 func (p *WorkerPool) Submit(fn func()) {

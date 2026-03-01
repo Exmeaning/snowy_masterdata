@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -18,36 +17,16 @@ import (
 	"github.com/klauspost/pgzip"
 )
 
-// File extensions that benefit from precompression
 var compressibleExtensions = map[string]bool{
-	".json":  true,
-	".js":    true,
-	".css":   true,
-	".html":  true,
-	".htm":   true,
-	".xml":   true,
-	".svg":   true,
-	".txt":   true,
-	".csv":   true,
-	".md":    true,
-	".yaml":  true,
-	".yml":   true,
-	".toml":  true,
-	".ini":   true,
-	".cfg":   true,
-	".conf":  true,
-	".log":   true,
-	".map":   true,
-	".wasm":  true,
-	".ico":   true,
-	".ttf":   true,
-	".otf":   true,
-	".eot":   true,
-	".woff":  true,
-	".woff2": true,
+	".json": true, ".js": true, ".css": true, ".html": true,
+	".htm": true, ".xml": true, ".svg": true, ".txt": true,
+	".csv": true, ".md": true, ".yaml": true, ".yml": true,
+	".toml": true, ".ini": true, ".cfg": true, ".conf": true,
+	".map": true, ".wasm": true, ".ico": true,
+	".ttf": true, ".otf": true, ".eot": true,
+	".woff": true, ".woff2": true,
 }
 
-// Minimum file size for compression (bytes)
 const minCompressSize = 256
 
 type Compressor struct {
@@ -66,57 +45,45 @@ func isCompressible(path string) bool {
 	return compressibleExtensions[ext]
 }
 
-// CompressAll performs gzip + brotli precompression on all eligible files in dir
+// CompressAll 全量压缩（仅在构建阶段调用）
 func (c *Compressor) CompressAll(ctx context.Context, dir string) error {
 	start := time.Now()
-	var totalFiles int64
-	var compressedFiles int64
-	var totalOrigSize int64
-	var mu sync.Mutex
-	_ = mu
+	var totalFiles, compressedFiles, totalOrigSize int64
 
 	pool := NewWorkerPool(c.workers)
-	var walkErr error
 
 	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
-
 		if info.IsDir() {
 			return nil
 		}
-
-		// Skip already compressed files
 		if strings.HasSuffix(path, ".gz") || strings.HasSuffix(path, ".br") {
 			return nil
 		}
 
 		atomic.AddInt64(&totalFiles, 1)
 
-		if !isCompressible(path) {
+		if !isCompressible(path) || info.Size() < minCompressSize {
 			return nil
 		}
 
-		if info.Size() < minCompressSize {
-			return nil
-		}
-
+		size := info.Size()
+		filePath := path
 		pool.Submit(func() {
-			if err := c.compressFile(path); err != nil {
-				log.Printf("WARNING: Failed to compress %s: %v", path, err)
+			if err := compressFile(filePath); err != nil {
+				log.Printf("WARNING: compress %s: %v", filePath, err)
 				return
 			}
 			atomic.AddInt64(&compressedFiles, 1)
-			atomic.AddInt64(&totalOrigSize, info.Size())
+			atomic.AddInt64(&totalOrigSize, size)
 		})
-
 		return nil
 	})
 
@@ -125,18 +92,13 @@ func (c *Compressor) CompressAll(ctx context.Context, dir string) error {
 	if err != nil {
 		return err
 	}
-	if walkErr != nil {
-		return walkErr
-	}
 
-	elapsed := time.Since(start)
-	log.Printf("Compression complete: %d/%d files compressed, %.1f MB original, took %v",
-		compressedFiles, totalFiles, float64(totalOrigSize)/1024/1024, elapsed)
-
+	log.Printf("Compression done: %d/%d files, %.1f MB original, %v elapsed",
+		compressedFiles, totalFiles, float64(totalOrigSize)/1024/1024, time.Since(start))
 	return nil
 }
 
-// CompressFiles compresses specific files (used for incremental updates)
+// CompressFiles 增量压缩（生产阶段调用）
 func (c *Compressor) CompressFiles(ctx context.Context, files []string) error {
 	pool := NewWorkerPool(c.workers)
 
@@ -151,22 +113,18 @@ func (c *Compressor) CompressFiles(ctx context.Context, files []string) error {
 		pool.Submit(func() {
 			info, err := os.Stat(file)
 			if err != nil {
-				// File might have been deleted
-				// Clean up stale .gz/.br
+				// 文件被删除，清理压缩文件
 				os.Remove(file + ".gz")
 				os.Remove(file + ".br")
 				return
 			}
-
 			if !isCompressible(file) || info.Size() < minCompressSize {
-				// Remove stale compressed versions if file no longer qualifies
 				os.Remove(file + ".gz")
 				os.Remove(file + ".br")
 				return
 			}
-
-			if err := c.compressFile(file); err != nil {
-				log.Printf("WARNING: Failed to compress %s: %v", file, err)
+			if err := compressFile(file); err != nil {
+				log.Printf("WARNING: compress %s: %v", file, err)
 			}
 		})
 	}
@@ -175,63 +133,57 @@ func (c *Compressor) CompressFiles(ctx context.Context, files []string) error {
 	return nil
 }
 
-func (c *Compressor) compressFile(path string) error {
+// RemoveCompressed 删除文件及其压缩版本
+func (c *Compressor) RemoveCompressed(servePath string) {
+	os.Remove(servePath + ".gz")
+	os.Remove(servePath + ".br")
+	os.Remove(servePath)
+}
+
+func compressFile(path string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return fmt.Errorf("read %s: %w", path, err)
+		return fmt.Errorf("read: %w", err)
 	}
 
-	// Gzip compression
-	if err := compressGzip(path+".gz", data); err != nil {
-		return fmt.Errorf("gzip %s: %w", path, err)
+	// Gzip
+	if err := writeGzip(path+".gz", data); err != nil {
+		return fmt.Errorf("gzip: %w", err)
 	}
 
-	// Brotli compression
-	if err := compressBrotli(path+".br", data); err != nil {
-		return fmt.Errorf("brotli %s: %w", path, err)
+	// Brotli
+	if err := writeBrotli(path+".br", data); err != nil {
+		return fmt.Errorf("brotli: %w", err)
 	}
 
 	return nil
 }
 
-func compressGzip(outputPath string, data []byte) error {
+func writeGzip(out string, data []byte) error {
 	var buf bytes.Buffer
-	writer, err := pgzip.NewWriterLevel(&buf, pgzip.BestCompression)
+	w, err := pgzip.NewWriterLevel(&buf, pgzip.BestCompression)
 	if err != nil {
 		return err
 	}
-
-	if _, err := writer.Write(data); err != nil {
-		writer.Close()
+	if _, err := w.Write(data); err != nil {
+		w.Close()
 		return err
 	}
-
-	if err := writer.Close(); err != nil {
+	if err := w.Close(); err != nil {
 		return err
 	}
-
-	return os.WriteFile(outputPath, buf.Bytes(), 0644)
+	return os.WriteFile(out, buf.Bytes(), 0644)
 }
 
-func compressBrotli(outputPath string, data []byte) error {
+func writeBrotli(out string, data []byte) error {
 	var buf bytes.Buffer
-	writer := brotli.NewWriterLevel(&buf, brotli.BestCompression)
-
-	if _, err := io.Copy(writer, bytes.NewReader(data)); err != nil {
-		writer.Close()
+	w := brotli.NewWriterLevel(&buf, brotli.BestCompression)
+	if _, err := io.Copy(w, bytes.NewReader(data)); err != nil {
+		w.Close()
 		return err
 	}
-
-	if err := writer.Close(); err != nil {
+	if err := w.Close(); err != nil {
 		return err
 	}
-
-	return os.WriteFile(outputPath, buf.Bytes(), 0644)
-}
-
-// RemoveCompressed removes .gz and .br for a given file path in serve dir
-func (c *Compressor) RemoveCompressed(servePath string) {
-	os.Remove(servePath + ".gz")
-	os.Remove(servePath + ".br")
-	os.Remove(servePath)
+	return os.WriteFile(out, buf.Bytes(), 0644)
 }

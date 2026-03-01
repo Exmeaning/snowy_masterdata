@@ -1,5 +1,4 @@
 {
-    # Global options
     auto_https off
     admin off
 }
@@ -7,37 +6,24 @@
 :80 {
     root * /data/serve
 
-    # Enable precompressed file serving (brotli first, then gzip)
     file_server {
         precompressed br gzip
     }
 
-    # Set proper cache headers
     header {
-        # CORS headers
         Access-Control-Allow-Origin *
         Access-Control-Allow-Methods "GET, HEAD, OPTIONS"
         Access-Control-Allow-Headers "Content-Type, Accept-Encoding"
-
-        # Cache control - 5 minutes for frequently updated data
         Cache-Control "public, max-age=300, must-revalidate"
-
-        # Security headers
         X-Content-Type-Options nosniff
-        X-Frame-Options DENY
-
-        # Remove server identification
         -Server
     }
 
-    # JSON files get shorter cache
     @json path *.json
     header @json Cache-Control "public, max-age=60, must-revalidate"
 
-    # Health check endpoint
     respond /health 200
 
-    # Logging
     log {
         output stdout
         format console

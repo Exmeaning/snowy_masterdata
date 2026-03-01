@@ -1,26 +1,36 @@
-# ──────────────────────────────────────────────────────────────
-# Stage 1: Build the Go binary
-# ──────────────────────────────────────────────────────────────
-FROM golang:1.22-alpine AS builder
+# ══════════════════════════════════════════════════════════════
+# Stage 1: 编译 Go 二进制
+# ══════════════════════════════════════════════════════════════
+FROM golang:1.22-alpine AS go-builder
 
 RUN apk add --no-cache git gcc musl-dev
 
 WORKDIR /build
-
-# Cache module downloads
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Copy source and build
 COPY *.go ./
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /haruki-builder .
 
-# ──────────────────────────────────────────────────────────────
-# Stage 2: Final runtime image
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# Stage 2: 构建阶段 — clone + 预处理 + 全量 gzip/br 压缩
+#   所有 CPU 密集工作在此完成，不消耗生产服务器 CPU
+# ══════════════════════════════════════════════════════════════
+FROM alpine:3.20 AS data-builder
+
+RUN apk add --no-cache git ca-certificates
+
+COPY --from=go-builder /haruki-builder /usr/local/bin/haruki-builder
+
+# 执行：clone → preprocess → sync → compress
+# 全量压缩在 docker build 阶段完成
+RUN haruki-builder -mode=build -repo=/data/repo -serve-dir=/data/serve -workers=0
+
+# ══════════════════════════════════════════════════════════════
+# Stage 3: 最终运行镜像 — 体积最小，只做增量工作
+# ══════════════════════════════════════════════════════════════
 FROM alpine:3.20
 
-# Install runtime dependencies
 RUN apk add --no-cache \
     git \
     ca-certificates \
@@ -28,83 +38,55 @@ RUN apk add --no-cache \
     caddy \
     tini
 
-# Copy the Go binary
-COPY --from=builder /haruki-builder /usr/local/bin/haruki-builder
+# 复制二进制
+COPY --from=go-builder /haruki-builder /usr/local/bin/haruki-builder
 
-# Copy Caddy config
+# 复制构建阶段产出的 repo（含 .git，用于增量 fetch）
+COPY --from=data-builder /data/repo /data/repo
+
+# 复制已压缩好的静态文件
+COPY --from=data-builder /data/serve /data/serve
+
+# 复制 Caddy 配置
 COPY Caddyfile /etc/caddy/Caddyfile
 
-# Create data directories
-RUN mkdir -p /data/repo /data/serve
-
-# Create entrypoint script
+# 入口脚本：同时启动 watcher + caddy
 RUN cat > /entrypoint.sh << 'SCRIPT'
 #!/bin/sh
 set -e
 
-echo "=== Starting Haruki Static Server ==="
-echo "Starting time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+echo "=== Haruki Static Server ==="
+echo "Start: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 
-# Start the builder (clones, compresses, watches) in background
-echo "Starting builder..."
-haruki-builder &
+# 增量监测进程（后台）
+haruki-builder -mode=serve -repo=/data/repo -serve-dir=/data/serve -workers=2 &
 BUILDER_PID=$!
 
-# Wait for initial clone and compression to complete
-# by watching for the serve directory to be populated
-echo "Waiting for initial build to complete..."
-TIMEOUT=600
-ELAPSED=0
-while [ ! -f /data/serve/.git_synced ] && [ $ELAPSED -lt $TIMEOUT ]; do
-# Check if builder is still running
-if ! kill -0 $BUILDER_PID 2>/dev/null; then
-echo "ERROR: Builder process died unexpectedly"
-exit 1
-fi
-sleep 2
-ELAPSED=$((ELAPSED + 2))
-done
-
-# Give a moment for compression to start
-sleep 5
-
-# Start Caddy
-echo "Starting Caddy web server..."
+# Caddy（后台）
 caddy run --config /etc/caddy/Caddyfile &
 CADDY_PID=$!
 
-echo "=== All services started ==="
-echo "Builder PID: $BUILDER_PID"
-echo "Caddy PID: $CADDY_PID"
+echo "Builder PID=$BUILDER_PID  Caddy PID=$CADDY_PID"
 
-# Handle signals gracefully
 cleanup() {
 echo "Shutting down..."
 kill $BUILDER_PID 2>/dev/null || true
 kill $CADDY_PID 2>/dev/null || true
 wait
-exit 0
 }
-
 trap cleanup SIGTERM SIGINT
 
-# Wait for any process to exit
+# 等待任意子进程退出
 wait -n $BUILDER_PID $CADDY_PID
 EXIT_CODE=$?
-
-echo "A process exited with code $EXIT_CODE, shutting down..."
+echo "Process exited ($EXIT_CODE), stopping all..."
 cleanup
+exit $EXIT_CODE
 SCRIPT
-
 RUN chmod +x /entrypoint.sh
 
-# Expose port 80
 EXPOSE 80
 
-# Resource limits via labels (for documentation)
-LABEL maintainer="haruki-builder" \
-    description="Auto-updating static file server with precompression"
-
-# Use tini as init system for proper signal handling
+# 生产阶段限制 watcher 只用 2 线程压缩，极低 CPU 占用
 ENTRYPOINT ["tini", "--"]
 CMD ["/entrypoint.sh"]

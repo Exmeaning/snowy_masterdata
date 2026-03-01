@@ -11,18 +11,16 @@ import (
 	"strings"
 )
 
-// ───────────────────────────────────────────────────────────────
-// Go port of the Python costume preprocessor
-// ───────────────────────────────────────────────────────────────
-
 var maleCharacterIDs = map[int]bool{
 	12: true, 13: true, 16: true, 23: true, 26: true,
 }
 
-var cosGroupRegex = regexp.MustCompile(`^(cos\d+)_`)
-var colorSuffixRegex = regexp.MustCompile(`_(\d{2})$`)
+var (
+	cosGroupRe    = regexp.MustCompile(`^(cos\d+)_`)
+	colorSuffixRe = regexp.MustCompile(`_(\d{2})$`)
+)
 
-// ─── Data structures ──────────────────────────────────────────
+// ── 数据结构 ──────────────────────────────────────────────────
 
 type Costume3D struct {
 	ID                 int    `json:"id"`
@@ -100,26 +98,23 @@ type OutputStats struct {
 	ByRarity   map[string]int `json:"by_rarity"`
 }
 
-type Output struct {
+type PreprocessorOutput struct {
 	Stats    OutputStats    `json:"stats"`
 	Costumes []CostumeEntry `json:"costumes"`
 }
 
-// ─── Core logic ───────────────────────────────────────────────
+// ── 核心逻辑 ──────────────────────────────────────────────────
 
 func getCostumeGroupPrefix(assetName string) string {
-	match := cosGroupRegex.FindStringSubmatch(assetName)
-	if match != nil {
-		return match[1]
+	if m := cosGroupRe.FindStringSubmatch(assetName); m != nil {
+		return m[1]
 	}
-	return colorSuffixRegex.ReplaceAllString(assetName, "")
+	return colorSuffixRe.ReplaceAllString(assetName, "")
 }
 
-func buildEntry(group []Costume3D, prefix, source string) CostumeEntry {
-	// Sort by colorId, then by id
+func buildCostumeEntry(group []Costume3D, prefix, source string) CostumeEntry {
 	sort.Slice(group, func(i, j int) bool {
-		ci := group[i].ColorID
-		cj := group[j].ColorID
+		ci, cj := group[i].ColorID, group[j].ColorID
 		if ci == 0 {
 			ci = 1
 		}
@@ -134,48 +129,37 @@ func buildEntry(group []Costume3D, prefix, source string) CostumeEntry {
 
 	rep := group[0]
 
-	// Build parts: partType -> deduplicated color-variant list
 	parts := make(map[string][]PartVariant)
-	seenAssets := make(map[string]map[string]bool) // partType -> assetName -> seen
+	seen := make(map[string]map[string]bool)
 
 	for _, c := range group {
-		pt := c.PartType
-		asset := c.AssetbundleName
-
-		if seenAssets[pt] == nil {
-			seenAssets[pt] = make(map[string]bool)
+		if seen[c.PartType] == nil {
+			seen[c.PartType] = make(map[string]bool)
 		}
-
-		if !seenAssets[pt][asset] {
-			seenAssets[pt][asset] = true
-			colorID := c.ColorID
-			if colorID == 0 {
-				colorID = 1
+		if !seen[c.PartType][c.AssetbundleName] {
+			seen[c.PartType][c.AssetbundleName] = true
+			cid := c.ColorID
+			if cid == 0 {
+				cid = 1
 			}
-			parts[pt] = append(parts[pt], PartVariant{
-				ColorID:         colorID,
+			parts[c.PartType] = append(parts[c.PartType], PartVariant{
+				ColorID:         cid,
 				ColorName:       c.ColorName,
-				AssetbundleName: asset,
+				AssetbundleName: c.AssetbundleName,
 			})
 		}
 	}
 
-	// Unique character IDs
-	charIDSet := make(map[int]bool)
+	charSet := make(map[int]bool)
 	for _, c := range group {
-		charIDSet[c.CharacterID] = true
+		charSet[c.CharacterID] = true
 	}
-	charIDs := make([]int, 0, len(charIDSet))
-	for id := range charIDSet {
-		charIDs = append(charIDs, id)
-	}
-	sort.Ints(charIDs)
+	charIDs := sortedKeys(charSet)
 
-	// Determine gender
 	gender := "female"
 	allMale := true
-	for _, cid := range charIDs {
-		if !maleCharacterIDs[cid] {
+	for _, id := range charIDs {
+		if !maleCharacterIDs[id] {
 			allMale = false
 			break
 		}
@@ -184,7 +168,6 @@ func buildEntry(group []Costume3D, prefix, source string) CostumeEntry {
 		gender = "male"
 	}
 
-	// Sorted part types
 	partTypes := make([]string, 0, len(parts))
 	for pt := range parts {
 		partTypes = append(partTypes, pt)
@@ -195,215 +178,155 @@ func buildEntry(group []Costume3D, prefix, source string) CostumeEntry {
 	if rarity == "" {
 		rarity = "normal"
 	}
-
 	cosType := rep.Costume3DType
 	if cosType == "" {
 		cosType = "normal"
 	}
 
 	return CostumeEntry{
-		ID:                 rep.ID,
-		Costume3DGroupID:   rep.Costume3DGroupID,
-		Costume3DType:      cosType,
-		Name:               rep.Name,
-		PartTypes:          partTypes,
-		CharacterIDs:       charIDs,
-		Gender:             gender,
-		Costume3DRarity:    rarity,
-		CostumePrefix:      prefix,
-		Designer:           rep.Designer,
-		PublishedAt:        rep.PublishedAt,
-		ArchivePublishedAt: rep.ArchivePublishedAt,
-		Parts:              parts,
-		Source:             source,
+		ID: rep.ID, Costume3DGroupID: rep.Costume3DGroupID,
+		Costume3DType: cosType, Name: rep.Name,
+		PartTypes: partTypes, CharacterIDs: charIDs,
+		Gender: gender, Costume3DRarity: rarity,
+		CostumePrefix: prefix, Designer: rep.Designer,
+		PublishedAt: rep.PublishedAt, ArchivePublishedAt: rep.ArchivePublishedAt,
+		Parts: parts, Source: source,
 	}
 }
 
 func RunPreprocessor(repoDir string) error {
 	masterDir := filepath.Join(repoDir, "master")
 
-	log.Println("[Preprocessor] Loading master data files...")
+	log.Println("[Preprocessor] Loading master data...")
 
-	// Load costume3ds.json
-	costume3ds, err := loadJSONFile[[]Costume3D](filepath.Join(masterDir, "costume3ds.json"))
+	costume3ds, err := loadJSON[[]Costume3D](filepath.Join(masterDir, "costume3ds.json"))
 	if err != nil {
-		return fmt.Errorf("load costume3ds.json: %w", err)
+		return fmt.Errorf("costume3ds.json: %w", err)
 	}
 
-	// Load cardCostume3ds.json
-	cardCostume3ds, err := loadJSONFile[[]CardCostume3D](filepath.Join(masterDir, "cardCostume3ds.json"))
+	cardCostume3ds, err := loadJSON[[]CardCostume3D](filepath.Join(masterDir, "cardCostume3ds.json"))
 	if err != nil {
-		return fmt.Errorf("load cardCostume3ds.json: %w", err)
+		return fmt.Errorf("cardCostume3ds.json: %w", err)
 	}
 
-	// Load costume3dShopItems.json
-	shopItems, err := loadJSONFile[[]Costume3DShopItem](filepath.Join(masterDir, "costume3dShopItems.json"))
+	shopItems, err := loadJSON[[]Costume3DShopItem](filepath.Join(masterDir, "costume3dShopItems.json"))
 	if err != nil {
-		return fmt.Errorf("load costume3dShopItems.json: %w", err)
+		return fmt.Errorf("costume3dShopItems.json: %w", err)
 	}
 
-	// ── Build lookup maps ──────────────────────────────────────
-
+	// ── Lookup maps ───────────────────────────────────────────
 	costumeByID := make(map[int]Costume3D)
 	for _, c := range *costume3ds {
 		costumeByID[c.ID] = c
 	}
 
-	// ── Step 1: Card-sourced costume3d IDs ─────────────────────
+	// ── Step 1: card → costume IDs ────────────────────────────
+	// (保留映射关系用于 Step 4)
 
-	cardIDToCostumeIDs := make(map[int]map[int]bool)
-	for _, entry := range *cardCostume3ds {
-		if cardIDToCostumeIDs[entry.CardID] == nil {
-			cardIDToCostumeIDs[entry.CardID] = make(map[int]bool)
-		}
-		cardIDToCostumeIDs[entry.CardID][entry.Costume3dID] = true
-	}
+	// ── Step 2: shop → costume IDs ────────────────────────────
+	// (保留映射关系用于 Step 5)
 
-	// ── Step 2: Shop-sourced costume3d IDs ─────────────────────
-
-	shopItemLookup := make(map[int]Costume3DShopItem)
-	for _, item := range *shopItems {
-		if item.HeadCostume3dID != nil {
-			shopItemLookup[*item.HeadCostume3dID] = item
-		}
-		if item.BodyCostume3dID != nil {
-			shopItemLookup[*item.BodyCostume3dID] = item
-		}
-	}
-
-	// ── Step 3: Group ALL costumes by prefix ───────────────────
-
+	// ── Step 3: 按 prefix 分组 ────────────────────────────────
 	prefixGroup := make(map[string][]Costume3D)
 	costumeToPrefix := make(map[int]string)
-
 	for _, c := range *costume3ds {
-		prefix := getCostumeGroupPrefix(c.AssetbundleName)
-		prefixGroup[prefix] = append(prefixGroup[prefix], c)
-		costumeToPrefix[c.ID] = prefix
+		p := getCostumeGroupPrefix(c.AssetbundleName)
+		prefixGroup[p] = append(prefixGroup[p], c)
+		costumeToPrefix[c.ID] = p
 	}
 
-	// ── Step 4: Process card-sourced costumes ──────────────────
-
+	// ── Step 4: card-sourced ──────────────────────────────────
 	processed := make(map[string]CostumeEntry)
-	seenPrefixes := make(map[string]bool)
+	seenPfx := make(map[string]bool)
 
-	cardPrefixToCardIDs := make(map[string]map[int]bool)
-	for _, entry := range *cardCostume3ds {
-		if _, ok := costumeByID[entry.Costume3dID]; !ok {
+	cardPfxCards := make(map[string]map[int]bool)
+	for _, e := range *cardCostume3ds {
+		if _, ok := costumeByID[e.Costume3dID]; !ok {
 			continue
 		}
-		prefix := costumeToPrefix[entry.Costume3dID]
-		if cardPrefixToCardIDs[prefix] == nil {
-			cardPrefixToCardIDs[prefix] = make(map[int]bool)
+		p := costumeToPrefix[e.Costume3dID]
+		if cardPfxCards[p] == nil {
+			cardPfxCards[p] = make(map[int]bool)
 		}
-		cardPrefixToCardIDs[prefix][entry.CardID] = true
+		cardPfxCards[p][e.CardID] = true
 	}
 
-	for prefix, cardIDSet := range cardPrefixToCardIDs {
-		if seenPrefixes[prefix] {
+	for pfx, cids := range cardPfxCards {
+		if seenPfx[pfx] {
 			continue
 		}
-		seenPrefixes[prefix] = true
-
-		group := prefixGroup[prefix]
-		if len(group) == 0 {
+		seenPfx[pfx] = true
+		grp := prefixGroup[pfx]
+		if len(grp) == 0 {
 			continue
 		}
-
-		entry := buildEntry(group, prefix, "card")
-
-		cardIDs := make([]int, 0, len(cardIDSet))
-		for id := range cardIDSet {
-			cardIDs = append(cardIDs, id)
-		}
-		sort.Ints(cardIDs)
-		entry.CardIDs = cardIDs
-
-		processed[prefix] = entry
+		entry := buildCostumeEntry(grp, pfx, "card")
+		entry.CardIDs = sortedKeys(cids)
+		processed[pfx] = entry
 	}
 
-	// ── Step 5: Process shop-sourced costumes ──────────────────
-
-	shopPrefixToItems := make(map[string][]Costume3DShopItem)
+	// ── Step 5: shop-sourced ──────────────────────────────────
+	shopPfxItems := make(map[string][]Costume3DShopItem)
 	for _, item := range *shopItems {
-		for _, cidPtr := range []*int{item.HeadCostume3dID, item.BodyCostume3dID} {
-			if cidPtr == nil {
+		for _, ptr := range []*int{item.HeadCostume3dID, item.BodyCostume3dID} {
+			if ptr == nil {
 				continue
 			}
-			cid := *cidPtr
-			if _, ok := costumeByID[cid]; !ok {
+			if _, ok := costumeByID[*ptr]; !ok {
 				continue
 			}
-			prefix := costumeToPrefix[cid]
-			shopPrefixToItems[prefix] = append(shopPrefixToItems[prefix], item)
+			p := costumeToPrefix[*ptr]
+			shopPfxItems[p] = append(shopPfxItems[p], item)
 		}
 	}
 
-	for prefix, items := range shopPrefixToItems {
-		if seenPrefixes[prefix] {
+	for pfx, items := range shopPfxItems {
+		if seenPfx[pfx] {
 			continue
 		}
-		seenPrefixes[prefix] = true
-
-		group := prefixGroup[prefix]
-		if len(group) == 0 {
+		seenPfx[pfx] = true
+		grp := prefixGroup[pfx]
+		if len(grp) == 0 {
 			continue
 		}
-
 		si := items[0]
-		entry := buildEntry(group, prefix, "shop")
+		entry := buildCostumeEntry(grp, pfx, "shop")
 		entry.ShopInfo = &ShopInfo{
-			ShopItemID:  si.ID,
-			ShopGroupID: si.GroupID,
-			Costs:       si.Costs,
-			StartAt:     si.StartAt,
+			ShopItemID: si.ID, ShopGroupID: si.GroupID,
+			Costs: si.Costs, StartAt: si.StartAt,
 		}
-
-		processed[prefix] = entry
+		processed[pfx] = entry
 	}
 
-	// ── Step 6: Process remaining costumes ─────────────────────
-
-	for prefix, group := range prefixGroup {
-		if seenPrefixes[prefix] {
+	// ── Step 6: remaining ─────────────────────────────────────
+	for pfx, grp := range prefixGroup {
+		if seenPfx[pfx] {
 			continue
 		}
-		seenPrefixes[prefix] = true
-
-		if len(group) == 0 {
+		seenPfx[pfx] = true
+		if len(grp) == 0 {
 			continue
 		}
-
-		rep := group[0]
-		source := "other"
-		if strings.Contains(rep.AssetbundleName, "default") {
-			source = "default"
+		src := "other"
+		if strings.Contains(grp[0].AssetbundleName, "default") {
+			src = "default"
 		}
-
-		entry := buildEntry(group, prefix, source)
-		processed[prefix] = entry
+		processed[pfx] = buildCostumeEntry(grp, pfx, src)
 	}
 
-	// ── Step 7: Build final output ─────────────────────────────
-
+	// ── Step 7: sort ──────────────────────────────────────────
 	result := make([]CostumeEntry, 0, len(processed))
-	for _, entry := range processed {
-		result = append(result, entry)
+	for _, e := range processed {
+		result = append(result, e)
 	}
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].ID < result[j].ID
-	})
+	sort.Slice(result, func(i, j int) bool { return result[i].ID < result[j].ID })
 
-	// ── Step 8: Build stats ────────────────────────────────────
-
+	// ── Step 8: stats ─────────────────────────────────────────
 	stats := OutputStats{
-		Total:      len(result),
-		BySource:   make(map[string]int),
-		ByPartType: make(map[string]int),
-		ByGender:   make(map[string]int),
-		ByRarity:   make(map[string]int),
+		Total:    len(result),
+		BySource: make(map[string]int), ByPartType: make(map[string]int),
+		ByGender: make(map[string]int), ByRarity: make(map[string]int),
 	}
-
 	for _, item := range result {
 		stats.BySource[item.Source]++
 		for _, pt := range item.PartTypes {
@@ -413,42 +336,40 @@ func RunPreprocessor(repoDir string) error {
 		stats.ByRarity[item.Costume3DRarity]++
 	}
 
-	output := Output{
-		Stats:    stats,
-		Costumes: result,
-	}
+	output := PreprocessorOutput{Stats: stats, Costumes: result}
 
-	// ── Step 9: Write output ───────────────────────────────────
-
-	outputPath := filepath.Join(masterDir, "snowy_costumes.json")
+	// ── Step 9: write ─────────────────────────────────────────
+	outPath := filepath.Join(masterDir, "snowy_costumes.json")
 	data, err := json.MarshalIndent(output, "", "  ")
 	if err != nil {
-		return fmt.Errorf("marshal output: %w", err)
+		return fmt.Errorf("marshal: %w", err)
+	}
+	if err := os.WriteFile(outPath, data, 0644); err != nil {
+		return fmt.Errorf("write: %w", err)
 	}
 
-	if err := os.WriteFile(outputPath, data, 0644); err != nil {
-		return fmt.Errorf("write output: %w", err)
-	}
-
-	log.Printf("[Preprocessor] ✅ Written %s", outputPath)
-	log.Printf("[Preprocessor]    Total unique costumes: %d", stats.Total)
-	log.Printf("[Preprocessor]    By source:    %v", stats.BySource)
-	log.Printf("[Preprocessor]    By partType:  %v", stats.ByPartType)
-	log.Printf("[Preprocessor]    By gender:    %v", stats.ByGender)
-	log.Printf("[Preprocessor]    By rarity:    %v", stats.ByRarity)
-	log.Printf("[Preprocessor]    File size:    %.1f KB", float64(len(data))/1024)
-
+	log.Printf("[Preprocessor] ✅ %s (%d costumes, %.1f KB)", outPath, stats.Total, float64(len(data))/1024)
+	log.Printf("[Preprocessor]    source=%v gender=%v rarity=%v", stats.BySource, stats.ByGender, stats.ByRarity)
 	return nil
 }
 
-func loadJSONFile[T any](path string) (*T, error) {
+func loadJSON[T any](path string) (*T, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	var result T
-	if err := json.Unmarshal(data, &result); err != nil {
+	var v T
+	if err := json.Unmarshal(data, &v); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
-	return &result, nil
+	return &v, nil
+}
+
+func sortedKeys(m map[int]bool) []int {
+	keys := make([]int, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Ints(keys)
+	return keys
 }
