@@ -1,7 +1,7 @@
 # ══════════════════════════════════════════════════════════════
 # Stage 1: 编译 Go 二进制
 # ══════════════════════════════════════════════════════════════
-FROM golang:1.22-alpine AS go-builder
+FROM golang:1.23-alpine AS go-builder
 
 RUN apk add --no-cache git gcc musl-dev
 
