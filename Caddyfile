@@ -3,7 +3,7 @@
     admin off
 }
 
-:80 {
+{ $PORT:80 } {
     root * /data/serve
 
     file_server {
@@ -18,6 +18,11 @@
         X-Content-Type-Options nosniff
         -Server
     }
+
+    @options {
+        method OPTIONS
+    }
+    respond @options 204
 
     @json path *.json
     header @json Cache-Control "public, max-age=60, must-revalidate"
